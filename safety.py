@@ -1,4 +1,6 @@
 # tlesafety.py
+# 加入最近距离筛选/时间窗筛选
+
 import sys
 import math
 import time
@@ -221,20 +223,34 @@ def process_all_satellite_pairs():
     print(f"几何筛选共有 {num_geo_filter} 对被筛除，占 {num_geo_filter/(num_sats*(num_sats-1)//2)*100:.2f}%")
     print(f"所有目标对处理完成，耗时 {end - start:.2f}s, 平均 {(end - start)/(num_sats*(num_sats-1)//2):.3f}s/次")
 
+
 def single_satellite_safety():
     """处理单个卫星的安全评估"""
-    tles = readTarTLE(fname="data/all_tle_process.txt")
+    start = time.time()
+    tles = readTarTLE(fname="data/tartle_2.txt")
     if not tles:
-        print("Error: 没有读取到任何卫星数据。请检查tartle.txt文件。")
+        print("Error: 没有读取到任何卫星数据。请检查tartle_2.txt文件。")
         return
-    
-    # 选择第一个卫星作为目标，其他作为干扰
+
+    num_sats = len(tles)
+    if num_sats < 2:
+        print("Error: 需要至少两个卫星的TLE数据进行碰撞风险评估。请检查tartle_2.txt文件。")
+        return
+
     TarSat = CSatellite(tles[0].str1, tles[0].str2, tles[0].str3)
-    for i in range(1, len(tles)):
+    num_geo_filter = 0
+    pair_count = num_sats - 1
+
+    for i in range(1, num_sats):
         ConSat = CSatellite(tles[i].str1, tles[i].str2, tles[i].str3)
-        method(TarSat, ConSat)
+        num_geo_filter += method(TarSat, ConSat)
+
+    end = time.time()
+    print(f"共处理 {num_sats} 个目标，共处理 {pair_count} 对")
+    print(f"几何筛选共有 {num_geo_filter} 对被筛除，占 {num_geo_filter / pair_count * 100:.2f}%")
+    print(f"所有目标对处理完成，耗时 {end - start:.2f}s, 平均 {(end - start) / pair_count:.3f}s/次")
 
 if __name__ == "__main__":
     readCfg(fname="data/cfg.txt")
-    process_all_satellite_pairs()
-    # single_satellite_safety()
+    # process_all_satellite_pairs()
+    single_satellite_safety()
