@@ -1,66 +1,52 @@
-# satellite.py
+from __future__ import annotations
+
 import numpy as np
-from sgp4.api import Satrec, WGS72, jday
+from sgp4.api import Satrec, WGS72
 from astropy.time import Time, TimeDelta
-from astropy import units as u
+from typing import Union
 from closeApproach import CElement
-from poliastro.bodies import Earth
-from poliastro.twobody import Orbit
 
 class CSatellite:
-    def __init__(self, str1:str, str2:str, str3:str):
-        self.m_gStr1 = str1.strip()
-        self.m_gStr2 = str2.strip()
-        self.m_gStr3 = str3.strip()
-        self.satrec = Satrec.twoline2rv(self.m_gStr2, self.m_gStr3, WGS72)
+    def __init__(self, line1: str, line2: str, line3: str):
+        self.line1 = line1.strip()
+        self.line2 = line2.strip()
+        self.line3 = line3.strip()
+        self.satrec = Satrec.twoline2rv(self.line2, self.line3, WGS72)
+        self._epoch = self._tle_to_epoch()
 
-    def __del__(self):
-        pass
+    @property
+    def name(self) -> str:
+        return self.line1[2:].strip()
 
-    def GetSatName(self):
-        # 取第一行第三位开始的字符串作为卫星名称
-        Name = self.m_gStr1[2:].strip()
-        return Name
-    
-    def GetSatID(self):
-        # 取第二行前两位开始的字符串作为卫星ID
-        ID = self.m_gStr2[2:7].strip()
-        return ID
+    @property
+    def sat_id(self) -> str:
+        return self.line2[2:7].strip()
 
-    def _tle_to_epoch(self):
-        year = int(self.m_gStr2[18:20])
+    @property
+    def epoch(self) -> Time:
+        return self._epoch
+
+    def _tle_to_epoch(self) -> Time:
+        year = int(self.line2[18:20])
         year += 2000 if year < 57 else 1900
-        day_of_year = float(self.m_gStr2[20:32])
-        date = Time(f"{year}-01-01T00:00:00", scale='utc') + TimeDelta(day_of_year-1, format='jd')
-        return date
+        day_of_year = float(self.line2[20:32])
+        return Time(f"{year}-01-01T00:00:00", scale="utc") + TimeDelta(day_of_year - 1, format="jd")
 
-    def _state_at_jd(self, jd):
-        e, r, v = self.satrec.sgp4(jd, 0.0)
-        if e != 0:
-            raise RuntimeError(f"sgp4 error {e}")
-        return np.array(r), np.array(v)
+    def _state_at_jd(self, jd: float):
+        error_code, position, velocity = self.satrec.sgp4(jd, 0.0)
+        if error_code != 0:
+            raise RuntimeError(f"sgp4 error {error_code}")
+        return np.array(position), np.array(velocity)
 
-    def GetIniOrb(self):
-        epoch = self._tle_to_epoch()
-        jd = epoch.jd
-        r, v = self._state_at_jd(jd)
-        element = CElement()
-        element.SetData(epoch, r, v)
-        return element
+    def initial_element(self) -> CElement:
+        position, velocity = self._state_at_jd(self._epoch.jd)
+        return CElement.from_state(self._epoch, position, velocity)
 
-    def Propagate(self, Tf):
-        if isinstance(Tf, (int, float)):
-            span_sec = float(Tf)
-            epoch = self._tle_to_epoch()
-            target_time = epoch + TimeDelta(span_sec, format='sec')
-        else:
-            target_time = Tf
-            epoch = self._tle_to_epoch()
-            span_sec = (target_time - epoch).to(u.s).value
+    def propagate(self, target_time: Union[Time, int, float]) -> CElement:
+        if isinstance(target_time, (int, float)):
+            target_time = self._epoch + TimeDelta(float(target_time), format="sec")
+        elif not isinstance(target_time, Time):
+            raise TypeError("target_time must be astropy.time.Time or a number of seconds")
 
-        t = target_time
-        jd = t.jd
-        r, v = self._state_at_jd(jd)
-        orb = CElement()
-        orb.SetData(target_time, r, v)
-        return orb
+        position, velocity = self._state_at_jd(target_time.jd)
+        return CElement.from_state(target_time, position, velocity)
