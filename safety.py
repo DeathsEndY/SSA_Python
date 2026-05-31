@@ -6,7 +6,7 @@ safety.py
 交会分析由safety.py，近点与远点计算由closeApproach.py，卫星传播由satellite.py负责。
 
 0529 更新：增加了时间窗筛选的占位函数，调整了输出格式，并添加了tle处理的错误输出和跳过机制。
-0531 更新：原本处理卫星对部分数据冗余、序列化开销，现在精准传参，使用生成器和迭代器
+0531 更新：原本处理卫星对部分数据冗余、序列化开销，现在精准传参，使用生成器和迭代器；增加概率计算和进度显示
 """
 from __future__ import annotations
 
@@ -28,8 +28,8 @@ from satellite import CSatellite
 class SafetyConfig:
     threshold: float = 10.0
     day_window: float = 5.0
-    output_path: Path = Path("output/safety_output_part_tle0529.txt")
-    tle_file: Path = Path("data/part_tle0529.txt")
+    output_path: Path = Path("output/safety_output_part_tle0529_2.txt")
+    tle_file: Path = Path("data/part_tle0529_2.txt")
 
 
 @dataclass
@@ -419,14 +419,14 @@ def evaluate_pair(tar_sat: CSatellite, con_sat: CSatellite, config: SafetyConfig
 
     # 时间窗筛选，同时执行近点和远点计算
     valid_periods = _window_candidate_periods(tar_ele, con_ele, config, num_periods)
-    print(f"valid_periods: {valid_periods}" )
+    # print(f"valid_periods: {valid_periods}" )
     if len(valid_periods) == 0:
         return (1, 0, 0, 1)
 
     _evaluate_approach_mode(tar_sat, con_sat, valid_periods, config, find_arg_time)
     _evaluate_approach_mode(tar_sat, con_sat, valid_periods, config, find_dec_time)
 
-    print()
+    # print()
     return (0, 0, 0, 0)
 
 
@@ -459,7 +459,7 @@ def find_root_newton(tar_sat: CSatellite, con_sat: CSatellite, initial_time: Tim
         it += 1
 
     if it == max_iter:
-        print("Warning: Newton iteration reached max iterations; result may be imprecise.")
+        print("\nWarning: Newton iteration reached max iterations; result may be imprecise.")
     return current
 
 
@@ -483,14 +483,13 @@ def relative_rtn(tar_rv, con_rv):
     return np.dot(mat.T, tar_rv[:3] - con_rv[:3])
 
 
-def process_satellite_pair(pair):
+def process_satellite_pair(args):
     '''
     处理单个卫星对的入口函数：从TLE信息创建卫星对象，执行评估，并处理可能的异常。
     '''
-    i, j, tles, config = pair
-    info_i = tles[i]
-    info_j = tles[j]
-    print(f"处理卫星对: [{i}] {info_i.line1} & [{j}] {info_j.line1}")
+    i, info_i, j, info_j, config = args
+    # print(f"处理卫星对: [{i}] {info_i.line1} & [{j}] {info_j.line1}")
+
     try:
         tar = CSatellite(info_i.line1, info_i.line2, info_i.line3)
         con = CSatellite(info_j.line1, info_j.line2, info_j.line3)
@@ -510,10 +509,10 @@ def process_satellite_pair(pair):
             pass
         return (1, 0, 0, 0)
 
-
-def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
+# def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
     '''
-    批量处理所有卫星对：从 TLE 文件中读取数据，生成所有唯一对，调用process_satellite_pair并行评估每对的安全性。
+    批量处理所有卫星对：
+    从 TLE 文件中读取数据，生成所有唯一对，调用process_satellite_pair并行评估每对的安全性。
     '''
     start = time.time()
     config = config or load_config()
@@ -523,11 +522,19 @@ def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
         print("Error: 需要至少两个卫星的TLE数据。")
         sys.exit(1)
 
-    pairs = [(i, j, tles, config) for i in range(n) for j in range(i + 1, n)]
-    with Pool(processes=8) as pool:
-        results = pool.map(process_satellite_pair, pairs)
+    # 1. 使用生成器按需生成任务，避免一次性占用大量内存
+    def generate_tasks():
+        for i in range(n):
+            for j in range(i + 1, n):
+                # 只传递索引、两颗卫星的具体信息和配置
+                yield (i, tles[i], j, tles[j], config)
 
-    # results are tuples (filtered_flag, geo1_filtered, geo2_filtered, time_filtered)
+    # 2. 使用 imap_unordered 处理任务 (由于只做统计，结果的顺序无关紧要，unordered 效率最高)
+    # chunksize 让每个子进程一次性领走一批任务，减少通信开销
+    with Pool(processes=8) as pool:
+        results = list(pool.imap_unordered(process_satellite_pair, generate_tasks(), chunksize=1000))
+
+    # 结果是tuples (filtered_flag, geo1_filtered, geo2_filtered, time_filtered)
     total_filtered = sum(r[0] for r in results)
     num_geo1_filtered = sum(r[1] for r in results)
     num_geo2_filtered = sum(r[2] for r in results)
@@ -541,6 +548,70 @@ def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
     print(f"总共被筛除 {total_filtered} 对，占 {total_filtered / count * 100:.2f}%")
     print(f"耗时 {end - start:.2f}s, 平均 {(end - start) / count:.3f}s/次")
 
+def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
+    '''
+    批量处理所有卫星对：从 TLE 文件中读取数据，生成所有唯一对，调用process_satellite_pair并行评估每对的安全性。
+    '''
+    start = time.time()
+    config = config or load_config()
+    tles = read_tar_tle(config=config)
+    n = len(tles)
+    if n < 2:
+        print("Error: 需要至少两个卫星的TLE数据。")
+        sys.exit(1)
+
+    total_pairs = n * (n - 1) // 2
+
+    def generate_tasks():
+        for i in range(n):
+            for j in range(i + 1, n):
+                yield (i, tles[i], j, tles[j], config)
+
+    results = []
+    last_logged_milestone = -1  # 记录上一次写入文件的进度里程碑
+
+    print("开始处理卫星对，进度如下：")
+    with Pool(processes=8) as pool:
+        iterator = pool.imap_unordered(process_satellite_pair, generate_tasks(), chunksize=1000)
+        
+        for idx, result in enumerate(iterator, start=1):
+            results.append(result)
+            
+            # 1. 计算当前的精确百分比
+            percent = (idx / total_pairs) * 100
+            
+            # 2. 在终端实时同行覆盖刷新
+            print(f"\r进度: [{idx}/{total_pairs}] {percent:.2f}% 完成", end="", flush=True)
+            
+            # 3. 在输出文件中里程碑式记录 (这里设置为每 5% 记录一次)
+            # 通过取整来判断是否到达新的 5% 节点
+            milestone = int(percent // 5) * 5 
+            if milestone % 5 == 0 and milestone != last_logged_milestone:
+                last_logged_milestone = milestone
+                progress_msg = f"--- 进度报告: 已完成 {milestone}% ({idx}/{total_pairs}) ---\n"
+                
+                try:
+                    config.output_path.parent.mkdir(parents=True, exist_ok=True)
+                    with config.output_path.open("a", encoding="utf-8") as f:
+                        f.write(progress_msg)
+                except Exception:
+                    pass # 若写入失败静默处理，避免中断主计算流程
+                    
+    print() # 进度条结束后输出一个换行符，防止后续统计数据粘在同一行
+
+    # --- 后续的统计和打印代码保持不变 ---
+    total_filtered = sum(r[0] for r in results)
+    num_geo1_filtered = sum(r[1] for r in results)
+    num_geo2_filtered = sum(r[2] for r in results)
+    num_time_filtered = sum(r[3] for r in results)
+    end = time.time()
+    
+    print(f"共处理 {n} 个目标，共处理 {total_pairs} 对")
+    print(f"几何筛选1共有 {num_geo1_filtered} 对被筛除，占 {num_geo1_filtered / total_pairs * 100:.2f}%")
+    print(f"几何筛选2共有 {num_geo2_filtered} 对被筛除，占 {num_geo2_filtered / total_pairs * 100:.2f}%")
+    print(f"时间窗筛选共有 {num_time_filtered} 对被筛除，占 {num_time_filtered / total_pairs * 100:.2f}%")
+    print(f"总共被筛除 {total_filtered} 对，占 {total_filtered / total_pairs * 100:.2f}%")
+    print(f"耗时 {end - start:.2f}s, 平均 {(end - start) / total_pairs:.3f}s/次")
 
 def single_satellite_safety(config: SafetyConfig | None = None) -> None:
     '''
