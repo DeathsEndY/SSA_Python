@@ -6,6 +6,7 @@ safety.py
 交会分析由safety.py，近点与远点计算由closeApproach.py，卫星传播由satellite.py负责。
 
 0529 更新：增加了时间窗筛选的占位函数，调整了输出格式，并添加了tle处理的错误输出和跳过机制。
+0531 更新：原本处理卫星对部分数据冗余、序列化开销，现在精准传参，使用生成器和迭代器
 """
 from __future__ import annotations
 
@@ -66,7 +67,8 @@ def load_config(*, threshold: Optional[float] = None, day_window: Optional[float
 
 
 def read_tar_tle(fname: Optional[Union[str, Path]] = None, config: Optional[SafetyConfig] = None) -> List[TLEInfo]:
-    """从简单的文件格式读取 TLE：每三行为一组（line1,line2,line3）。
+    """
+    从简单的文件格式读取 TLE：每三行为一组（line1,line2,line3）。
     若未提供 `fname`，则使用 `config.tle_file` 或 `SafetyConfig` 的默认值。
     """
     if fname is None:
@@ -79,7 +81,41 @@ def read_tar_tle(fname: Optional[Union[str, Path]] = None, config: Optional[Safe
     if not path.exists():
         return []
     lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    return [TLEInfo(line1=lines[i], line2=lines[i + 1], line3=lines[i + 2]) for i in range(0, len(lines), 3)]
+
+    entries: list[TLEInfo] = []
+    seen: set[tuple[str, ...]] = set()
+    for i in range(0, len(lines), 3):
+        if i + 2 >= len(lines):
+            break
+        line1 = lines[i]
+        line2 = lines[i + 1]
+        line3 = lines[i + 2]
+        fields = line2.split()
+        if len(fields) >= 8:
+            tle_key = tuple(fields[3:8])
+        else:
+            tle_key = (line2,)
+        if tle_key in seen:
+            duplicate_msg = (
+                f"跳过重复 TLE：line1={line1}，line2 中间字段 {fields[3:8] if len(fields) >= 8 else line2} 与已有条目一致。"
+            )
+            print(duplicate_msg)
+            if config is not None:
+                try:
+                    output_path = config.output_path
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    with output_path.open("a", encoding="utf-8") as f:
+                        f.write(duplicate_msg + "\n")
+                except Exception:
+                    pass
+            continue
+        seen.add(tle_key)
+        entries.append(TLEInfo(line1=line1, line2=line2, line3=line3))
+
+    print("成功读取 TLE 条目数量:", len(entries))
+    time.sleep(1)  # 模拟读取延迟
+
+    return entries
 
 
 def geometrical_filter1(tar_sat: CSatellite, con_sat: CSatellite, config: SafetyConfig) -> bool:
@@ -217,51 +253,68 @@ def _window_candidate_periods(
     con_ele: CElement,
     config: SafetyConfig,
     num_periods: int,
-) -> range:
+) -> list[int]:
+    """
+    计算基于相位差的有效时间窗：
+    返回目标卫星 (tar_sat) 可能发生危险交会的周期索引列表。
+    """
     line_dir = _intersection_line_direction(tar_ele, con_ele)
+    # 如果轨道近似平行或共面，保守起见返回所有周期
     if np.linalg.norm(line_dir) < 1e-8:
-        return range(num_periods)
+        return list(range(num_periods))
 
-    # 计算两颗卫星在交线附近的中心过越时间及对应的轨道速度（用 vis-viva 估计）
-    nu_tar = _true_anomaly_for_direction(tar_ele, line_dir)
-    nu_con = _true_anomaly_for_direction(con_ele, line_dir)
-    t_tar = _time_from_true_anomaly(tar_ele, nu_tar)
-    t_con = _time_from_true_anomaly(con_ele, nu_con)
-    t_tar = _normalize_time_to_epoch(t_tar, tar_ele.epoch, tar_ele.period)
-    t_con = _normalize_time_to_epoch(t_con, con_ele.epoch, con_ele.period)
+    line_dir_unit = line_dir / np.linalg.norm(line_dir)
+    valid_indices = set()
+    
+    T_tar = tar_ele.period
+    T_con = con_ele.period
 
-    # 轨道处速度（标量）通过 vis-viva 近似计算
-    r_tar = _radius_at_true_anomaly(tar_ele, nu_tar)
-    r_con = _radius_at_true_anomaly(con_ele, nu_con)
-    v_tar = np.sqrt(GM_EARTH * (2.0 / r_tar - 1.0 / tar_ele.semi_major_axis))
-    v_con = np.sqrt(GM_EARTH * (2.0 / r_con - 1.0 / con_ele.semi_major_axis))
-
-    # 相对速度的保守估计：两速度之和（upper bound），并乘以放宽因子
-    rel_v = float(v_tar + v_con)
-    safety_factor = 1.5
-    rel_v *= safety_factor
-
-    half_window = (config.threshold * safety_factor) / max(rel_v, 1e-6)
-
-    tar_start = t_tar - TimeDelta(half_window, format="sec")
-    tar_end = t_tar + TimeDelta(half_window, format="sec")
-    con_start = t_con - TimeDelta(half_window, format="sec")
-    con_end = t_con + TimeDelta(half_window, format="sec")
-
-    overlap_start = max(tar_start, con_start)
-    overlap_end = min(tar_end, con_end)
-    if overlap_end < overlap_start:
-        return range(0)
-
-    base_epoch = tar_ele.epoch if (tar_ele.epoch - con_ele.epoch).sec >= 0 else con_ele.epoch
-    period = tar_ele.period
-    start_idx = int(np.floor((overlap_start - base_epoch).sec / period))
-    end_idx = int(np.floor((overlap_end - base_epoch).sec / period))
-    start_idx = max(0, start_idx)
-    end_idx = min(num_periods - 1, end_idx)
-    if end_idx < start_idx:
-        return range(0)
-    return range(start_idx, end_idx + 1)
+    # 必须检查交线的两个穿透点 (方向与反方向)
+    for direction in [line_dir_unit, -line_dir_unit]:
+        nu_tar = _true_anomaly_for_direction(tar_ele, direction)
+        nu_con = _true_anomaly_for_direction(con_ele, direction)
+        
+        t_tar_0 = _time_from_true_anomaly(tar_ele, nu_tar)
+        t_con_0 = _time_from_true_anomaly(con_ele, nu_con)
+        
+        # 将基准交点时间归一化到 epoch 附近
+        t_tar_0 = _normalize_time_to_epoch(t_tar_0, tar_ele.epoch, T_tar)
+        t_con_0 = _normalize_time_to_epoch(t_con_0, con_ele.epoch, T_con)
+        
+        # Vis-viva 方程估算交点处的轨道速度
+        r_tar = _radius_at_true_anomaly(tar_ele, nu_tar)
+        r_con = _radius_at_true_anomaly(con_ele, nu_con)
+        v_tar = np.sqrt(GM_EARTH * (2.0 / r_tar - 1.0 / tar_ele.semi_major_axis))
+        v_con = np.sqrt(GM_EARTH * (2.0 / r_con - 1.0 / con_ele.semi_major_axis))
+        
+        # 相对速度最大保守估计
+        rel_v = float(v_tar + v_con)
+        
+        # 计算安全时间窗 (考虑到二体摄动漂移，适当放宽系数到 3.0 或 5.0)
+        safety_factor = 50.0
+        half_window_sec = (config.threshold * safety_factor) / max(rel_v, 1e-6)
+        
+        # 遍历目标星的每一圈 n
+        for n in range(num_periods):
+            # 目标卫星第 n 圈到达交点的时间
+            t_tar_n = t_tar_0 + TimeDelta(n * T_tar, format="sec")
+            
+            # 计算次星到达交点最接近 t_tar_n 的那一圈 (m)
+            delta_t_sec = (t_tar_n - t_con_0).sec
+            m = round(delta_t_sec / T_con)
+            
+            # 为了防止浮点误差和边界情况，检查最接近的 3 圈 (m-1, m, m+1)
+            for dm in [-1, 0, 1]:
+                closest_t_con = t_con_0 + TimeDelta((m + dm) * T_con, format="sec")
+                diff_sec = abs((t_tar_n - closest_t_con).sec)
+                
+                # 如果两星到达交点的时间差小于安全窗口，说明可能发生碰撞
+                if diff_sec <= half_window_sec:
+                    valid_indices.add(n)
+                    break  # 当前 n 圈已被标记为危险，跳出内部 dm 循环
+                    
+    # 返回排序后的、可能发生交会的目标星圈数列表
+    return sorted(list(valid_indices))
 
 
 def geometrical_filter2(tar_sat: CSatellite, con_sat: CSatellite, config: SafetyConfig) -> bool:
@@ -325,12 +378,12 @@ def _write_close_approach(
 def _evaluate_approach_mode(
     tar_sat: CSatellite,
     con_sat: CSatellite,
-    period_indices: int,
+    period_indices: list[int],
     config: SafetyConfig,
     approach_fn: Callable[[CSatellite, CSatellite, int], 'ApproachInfo'],
 ) -> int:
     hits = 0
-    for i in range(period_indices):
+    for i in period_indices:
         approach_info = approach_fn(tar_sat, con_sat, i)
         miss = find_miss_distance(tar_sat, con_sat, approach_info.time)
         rel_vel = np.linalg.norm(
@@ -370,10 +423,8 @@ def evaluate_pair(tar_sat: CSatellite, con_sat: CSatellite, config: SafetyConfig
     if len(valid_periods) == 0:
         return (1, 0, 0, 1)
 
-    num_periods = valid_periods
-
-    _evaluate_approach_mode(tar_sat, con_sat, num_periods, config, find_arg_time)
-    _evaluate_approach_mode(tar_sat, con_sat, num_periods, config, find_dec_time)
+    _evaluate_approach_mode(tar_sat, con_sat, valid_periods, config, find_arg_time)
+    _evaluate_approach_mode(tar_sat, con_sat, valid_periods, config, find_dec_time)
 
     print()
     return (0, 0, 0, 0)
