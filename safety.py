@@ -6,30 +6,38 @@ safety.py
 交会分析由safety.py，近点与远点计算由closeApproach.py，卫星传播由satellite.py负责。
 
 0529 更新：增加了时间窗筛选的占位函数，调整了输出格式，并添加了tle处理的错误输出和跳过机制。
-0531 更新：原本处理卫星对部分数据冗余、序列化开销，现在精准传参，使用生成器和迭代器；增加概率计算和进度显示
+0531 更新：原本处理卫星对部分数据冗余、序列化开销，现在精准传参，使用生成器和迭代器；增加概率计算和进度显示; 增加TCA附近最大概率寻优
 """
 from __future__ import annotations
 
 import sys
 import time
+import datetime
 from dataclasses import dataclass
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Callable, List, Optional, Union
+from scipy.optimize import minimize_scalar
 
 import numpy as np
 from astropy.time import Time, TimeDelta
 
 from closeApproach import ApproachInfo, CElement, find_arg_time, find_dec_time, GM_EARTH
 from satellite import CSatellite
+from PcCalculate import tle_to_pc_at_time
+
+EMPIRICAL_ERRORS = [1.0, 5.0, 1.0]
+HBR = 0.15
+RELTOL = 1e-10
+HBR_TYPE = "square"
 
 
 @dataclass(frozen=True)
 class SafetyConfig:
-    threshold: float = 10.0
+    threshold: float = 15.0
     day_window: float = 5.0
-    output_path: Path = Path("output/safety_output_part_tle0529_2.txt")
-    tle_file: Path = Path("data/part_tle0529_2.txt")
+    output_path: Path = Path("output/safety_output_paper1.txt")
+    tle_file: Path = Path("data/paper1.txt")
 
 
 @dataclass
@@ -235,7 +243,7 @@ def _nearest_crossing_window(
     line_dir: np.ndarray,
     threshold: float,
 ) -> tuple[Time, Time]:
-    # 保留一个简易中心时间计算（旧接口兼容），但不再用于窗口宽度计算。
+    # 保留一个简易中心时间计算，但不再用于窗口宽度计算。
     nu = _true_anomaly_for_direction(orb, line_dir)
     t1 = _time_from_true_anomaly(orb, nu)
     t2 = _time_from_true_anomaly(orb, nu + np.pi)
@@ -248,6 +256,74 @@ def _nearest_crossing_window(
     return (center - TimeDelta(half_window, format="sec"), center + TimeDelta(half_window, format="sec"))
 
 
+# def _window_candidate_periods(
+#     tar_ele: CElement,
+#     con_ele: CElement,
+#     config: SafetyConfig,
+#     num_periods: int,
+# ) -> list[int]:
+#     """
+#     计算基于相位差的有效时间窗：
+#     返回目标卫星 (tar_sat) 可能发生危险交会的周期索引列表。
+#     """
+#     line_dir = _intersection_line_direction(tar_ele, con_ele)
+#     # 如果轨道近似平行或共面，保守起见返回所有周期
+#     if np.linalg.norm(line_dir) < 1e-8:
+#         return list(range(num_periods))
+
+#     line_dir_unit = line_dir / np.linalg.norm(line_dir)
+#     valid_indices = set()
+    
+#     T_tar = tar_ele.period
+#     T_con = con_ele.period
+
+#     # 必须检查交线的两个穿透点 (方向与反方向)
+#     for direction in [line_dir_unit, -line_dir_unit]:
+#         nu_tar = _true_anomaly_for_direction(tar_ele, direction)
+#         nu_con = _true_anomaly_for_direction(con_ele, direction)
+        
+#         t_tar_0 = _time_from_true_anomaly(tar_ele, nu_tar)
+#         t_con_0 = _time_from_true_anomaly(con_ele, nu_con)
+        
+#         # 将基准交点时间归一化到 epoch 附近
+#         t_tar_0 = _normalize_time_to_epoch(t_tar_0, tar_ele.epoch, T_tar)
+#         t_con_0 = _normalize_time_to_epoch(t_con_0, con_ele.epoch, T_con)
+        
+#         # Vis-viva 方程估算交点处的轨道速度
+#         r_tar = _radius_at_true_anomaly(tar_ele, nu_tar)
+#         r_con = _radius_at_true_anomaly(con_ele, nu_con)
+#         v_tar = np.sqrt(GM_EARTH * (2.0 / r_tar - 1.0 / tar_ele.semi_major_axis))
+#         v_con = np.sqrt(GM_EARTH * (2.0 / r_con - 1.0 / con_ele.semi_major_axis))
+        
+#         # 相对速度最大保守估计
+#         rel_v = float(v_tar + v_con)
+        
+#         # 计算安全时间窗
+#         safety_factor = 150
+#         half_window_sec = (config.threshold * safety_factor) / max(rel_v, 1e-6)
+        
+#         # 遍历目标星的每一圈 n
+#         for n in range(num_periods):
+#             # 目标卫星第 n 圈到达交点的时间
+#             t_tar_n = t_tar_0 + TimeDelta(n * T_tar, format="sec")
+            
+#             # 计算次星到达交点最接近 t_tar_n 的那一圈 (m)
+#             delta_t_sec = (t_tar_n - t_con_0).sec
+#             m = round(delta_t_sec / T_con)
+            
+#             # 为了防止浮点误差和边界情况，检查最接近的 3 圈 (m-1, m, m+1)
+#             for dm in [-1, 0, 1]:
+#                 closest_t_con = t_con_0 + TimeDelta((m + dm) * T_con, format="sec")
+#                 diff_sec = abs((t_tar_n - closest_t_con).sec)
+                
+#                 # 如果两星到达交点的时间差小于安全窗口，说明可能发生碰撞
+#                 if diff_sec <= half_window_sec:
+#                     valid_indices.add(n)
+#                     break  # 当前 n 圈已被标记为危险，跳出内部 dm 循环
+                    
+#     # 返回排序后的、可能发生交会的目标星圈数列表
+#     return sorted(list(valid_indices))
+
 def _window_candidate_periods(
     tar_ele: CElement,
     con_ele: CElement,
@@ -257,6 +333,7 @@ def _window_candidate_periods(
     """
     计算基于相位差的有效时间窗：
     返回目标卫星 (tar_sat) 可能发生危险交会的周期索引列表。
+    加入动态时间漂移补偿，防止多天预测时的相位误差导致漏筛。
     """
     line_dir = _intersection_line_direction(tar_ele, con_ele)
     # 如果轨道近似平行或共面，保守起见返回所有周期
@@ -290,9 +367,9 @@ def _window_candidate_periods(
         # 相对速度最大保守估计
         rel_v = float(v_tar + v_con)
         
-        # 计算安全时间窗 (考虑到二体摄动漂移，适当放宽系数到 3.0 或 5.0)
-        safety_factor = 50.0
-        half_window_sec = (config.threshold * safety_factor) / max(rel_v, 1e-6)
+        # 计算基础安全时间窗 (稍微放宽基础 safety_factor，原为 150)
+        safety_factor = 250
+        base_half_window_sec = (config.threshold * safety_factor) / max(rel_v, 1e-6)
         
         # 遍历目标星的每一圈 n
         for n in range(num_periods):
@@ -303,13 +380,19 @@ def _window_candidate_periods(
             delta_t_sec = (t_tar_n - t_con_0).sec
             m = round(delta_t_sec / T_con)
             
+            # 【核心修复】：引入随时间（圈数）增长的漂移补偿 (Drift Margin)
+            # 假设 SGP4 与理想开普勒周期的累积误差为每圈约增加 3~6 秒（LEO 卫星典型值）
+            # 根据主星和次星各自累积的圈数，动态放大安全时间窗
+            drift_margin = abs(n) * 10.0 + abs(m) * 10.0 
+            current_half_window = base_half_window_sec + drift_margin
+            
             # 为了防止浮点误差和边界情况，检查最接近的 3 圈 (m-1, m, m+1)
             for dm in [-1, 0, 1]:
                 closest_t_con = t_con_0 + TimeDelta((m + dm) * T_con, format="sec")
                 diff_sec = abs((t_tar_n - closest_t_con).sec)
                 
-                # 如果两星到达交点的时间差小于安全窗口，说明可能发生碰撞
-                if diff_sec <= half_window_sec:
+                # 使用动态放大的窗口进行判断
+                if diff_sec <= current_half_window:
                     valid_indices.add(n)
                     break  # 当前 n 圈已被标记为危险，跳出内部 dm 循环
                     
@@ -364,24 +447,27 @@ def _write_close_approach(
     con_sat: CSatellite,
     miss: MissInfo,
     rel_vel: float,
+    pc:float,
     output_path: Path,
 ) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("a", encoding="utf-8") as f:
         f.write(
             f"主目标{tar_sat.name} ID: {tar_sat.sat_id}, 次目标{con_sat.name} ID: {con_sat.sat_id} - "
-            f"时间 {miss.time.utc.iso}, 最近距离 {miss.min_distance:.3f} km, 相对速度 {rel_vel:.3f} km/s\n"
+            f"时间 {miss.time.utc.iso}, 最近距离 {miss.min_distance:.4f} km, 相对速度 {rel_vel:.3f} km/s, 碰撞概率 {pc:.4e}\n"
         )
     return 1
 
 
-def _evaluate_approach_mode(
-    tar_sat: CSatellite,
-    con_sat: CSatellite,
-    period_indices: list[int],
-    config: SafetyConfig,
-    approach_fn: Callable[[CSatellite, CSatellite, int], 'ApproachInfo'],
-) -> int:
+# def _evaluate_approach_mode(
+#     tar_sat: CSatellite,
+#     con_sat: CSatellite,
+#     tar_info: TLEInfo,
+#     con_info: TLEInfo,
+#     period_indices: list[int],
+#     config: SafetyConfig,
+#     approach_fn: Callable[[CSatellite, CSatellite, int], 'ApproachInfo'],
+# ) -> int:
     hits = 0
     for i in period_indices:
         approach_info = approach_fn(tar_sat, con_sat, i)
@@ -390,17 +476,119 @@ def _evaluate_approach_mode(
             tar_sat.propagate(approach_info.time).vel - con_sat.propagate(approach_info.time).vel
         )
         if miss.min_distance < config.threshold:
+            # 组装 PcCalculate 所需的 TLE 字典格式
+            sat1_tle_dict = {"name": tar_info.line1, "tle1": tar_info.line2, "tle2": tar_info.line3}
+            sat2_tle_dict = {"name": con_info.line1, "tle1": con_info.line2, "tle2": con_info.line3}
+            
+            # 提取标准的 datetime 对象 (无时区信息)
+            t_datetime = miss.time.to_datetime().replace(tzinfo=None)
+
+            try:
+                pc = tle_to_pc_at_time(
+                    sat1_tle_dict, sat2_tle_dict, t_datetime,
+                    rtn_errors_km=EMPIRICAL_ERRORS,
+                    hbr=HBR,
+                    reltol=RELTOL,
+                    hbr_type=HBR_TYPE
+                )
+            except Exception as e:
+                # 若计算抛出异常（例如协方差不正定），静默处理为 0，防止打断主循环
+                pc = 0.0
+
             hits += _write_close_approach(
                 tar_sat,
                 con_sat,
                 miss,
                 rel_vel,
+                pc,
                 config.output_path,
             )
     return hits
 
+def _evaluate_approach_mode(
+    tar_sat: CSatellite,
+    con_sat: CSatellite,
+    tar_info: TLEInfo,
+    con_info: TLEInfo,
+    period_indices: list[int],
+    config: SafetyConfig,
+    approach_fn: Callable[[CSatellite, CSatellite, int], 'ApproachInfo'],
+) -> int:
+    from scipy.optimize import minimize_scalar
+    import datetime
 
-def evaluate_pair(tar_sat: CSatellite, con_sat: CSatellite, config: SafetyConfig) -> tuple[int, int, int, int]:
+    hits = 0
+    for i in period_indices:
+        approach_info = approach_fn(tar_sat, con_sat, i)
+        
+        # 这里的 miss.time 即为精确的几何交会时间 (TCA)
+        miss = find_miss_distance(tar_sat, con_sat, approach_info.time)
+        rel_vel = np.linalg.norm(
+            tar_sat.propagate(miss.time).vel - con_sat.propagate(miss.time).vel
+        )
+        
+        if miss.min_distance < config.threshold:
+            # 组装 PcCalculate 所需的 TLE 字典格式
+            sat1_tle_dict = {"name": tar_info.line1, "tle1": tar_info.line2, "tle2": tar_info.line3}
+            sat2_tle_dict = {"name": con_info.line1, "tle1": con_info.line2, "tle2": con_info.line3}
+            
+            # 提取标准的 datetime 对象 (无时区信息) 作为基准 TCA
+            tca_dt = miss.time.to_datetime().replace(tzinfo=None)
+
+            # === 核心修改：在 TCA 附近搜索最大碰撞概率 ===
+            pc_search_window_sec = 1.5  # 搜索窗口，TCA 前后 1.5 秒
+            
+            def negative_pc_at_offset(offset: float) -> float:
+                t_eval = tca_dt + datetime.timedelta(seconds=float(offset))
+                try:
+                    pc_val = tle_to_pc_at_time(
+                        sat1_tle_dict, sat2_tle_dict, t_eval,
+                        rtn_errors_km=EMPIRICAL_ERRORS,
+                        hbr=HBR,
+                        reltol=RELTOL,
+                        hbr_type=HBR_TYPE
+                    )
+                    return -pc_val
+                except Exception:
+                    # 若积分失败或协方差截断异常，返回 0
+                    return 0.0
+
+            try:
+                # 使用 bounded 算法在 [-1.5s, 1.5s] 寻找使 Pc 最大的时间偏移
+                res_pc = minimize_scalar(
+                    negative_pc_at_offset,
+                    bounds=(-pc_search_window_sec, pc_search_window_sec),
+                    method='bounded',
+                    options={'xatol': 1e-3}  # 精度控制到毫秒级即可
+                )
+                max_pc = -res_pc.fun
+                
+                # 如果你想在日志中记录最大概率发生的精确时间，可以计算：
+                # max_pc_time = tca_dt + datetime.timedelta(seconds=res_pc.x)
+                
+            except Exception:
+                # 若优化器意外失败，平稳回退至直接计算 TCA 处的 Pc
+                max_pc = -negative_pc_at_offset(0.0)
+            # ===============================================
+
+            hits += _write_close_approach(
+                tar_sat,
+                con_sat,
+                miss,     # 保持传入 miss，这样日志里依然记录的是几何最近距离和 TCA
+                rel_vel,
+                max_pc,   # 传入优化后的最大碰撞概率
+                config.output_path,
+            )
+            
+    return hits
+
+def evaluate_pair(
+        tar_sat: CSatellite, 
+        con_sat: CSatellite,
+        tar_info: TLEInfo, 
+        con_info: TLEInfo,
+        config: SafetyConfig
+) -> tuple[int, int, int, int]:
     """
     多层筛选，若不通过返回 1，否则执行近点和远点计算。
     """
@@ -417,16 +605,16 @@ def evaluate_pair(tar_sat: CSatellite, con_sat: CSatellite, config: SafetyConfig
     con_ele = con_sat.initial_element()
     num_periods = max(1, int(config.day_window * 86400.0 / tar_ele.period))
 
-    # 时间窗筛选，同时执行近点和远点计算
-    valid_periods = _window_candidate_periods(tar_ele, con_ele, config, num_periods)
+    # 时间窗筛选
+    # valid_periods = _window_candidate_periods(tar_ele, con_ele, config, num_periods)
+    valid_periods = list(range(num_periods))
     # print(f"valid_periods: {valid_periods}" )
     if len(valid_periods) == 0:
         return (1, 0, 0, 1)
 
-    _evaluate_approach_mode(tar_sat, con_sat, valid_periods, config, find_arg_time)
-    _evaluate_approach_mode(tar_sat, con_sat, valid_periods, config, find_dec_time)
+    _evaluate_approach_mode(tar_sat, con_sat, tar_info, con_info, valid_periods, config, find_arg_time)
+    _evaluate_approach_mode(tar_sat, con_sat, tar_info, con_info, valid_periods, config, find_dec_time)
 
-    # print()
     return (0, 0, 0, 0)
 
 
@@ -493,7 +681,7 @@ def process_satellite_pair(args):
     try:
         tar = CSatellite(info_i.line1, info_i.line2, info_i.line3)
         con = CSatellite(info_j.line1, info_j.line2, info_j.line3)
-        return evaluate_pair(tar, con, config)
+        return evaluate_pair(tar, con, info_i, info_j, config)
     except Exception as e:
         err_msg = f"跳过卫星对 [{i} {info_i.line1} & {j} {info_j.line1}]，传播失败: {e}"
         print(err_msg)
@@ -509,44 +697,6 @@ def process_satellite_pair(args):
             pass
         return (1, 0, 0, 0)
 
-# def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
-    '''
-    批量处理所有卫星对：
-    从 TLE 文件中读取数据，生成所有唯一对，调用process_satellite_pair并行评估每对的安全性。
-    '''
-    start = time.time()
-    config = config or load_config()
-    tles = read_tar_tle(config=config)
-    n = len(tles)
-    if n < 2:
-        print("Error: 需要至少两个卫星的TLE数据。")
-        sys.exit(1)
-
-    # 1. 使用生成器按需生成任务，避免一次性占用大量内存
-    def generate_tasks():
-        for i in range(n):
-            for j in range(i + 1, n):
-                # 只传递索引、两颗卫星的具体信息和配置
-                yield (i, tles[i], j, tles[j], config)
-
-    # 2. 使用 imap_unordered 处理任务 (由于只做统计，结果的顺序无关紧要，unordered 效率最高)
-    # chunksize 让每个子进程一次性领走一批任务，减少通信开销
-    with Pool(processes=8) as pool:
-        results = list(pool.imap_unordered(process_satellite_pair, generate_tasks(), chunksize=1000))
-
-    # 结果是tuples (filtered_flag, geo1_filtered, geo2_filtered, time_filtered)
-    total_filtered = sum(r[0] for r in results)
-    num_geo1_filtered = sum(r[1] for r in results)
-    num_geo2_filtered = sum(r[2] for r in results)
-    num_time_filtered = sum(r[3] for r in results)
-    count = n * (n - 1) // 2
-    end = time.time()
-    print(f"共处理 {n} 个目标，共处理 {count} 对")
-    print(f"几何筛选1共有 {num_geo1_filtered} 对被筛除，占 {num_geo1_filtered / count * 100:.2f}%")
-    print(f"几何筛选2共有 {num_geo2_filtered} 对被筛除，占 {num_geo2_filtered / count * 100:.2f}%")
-    print(f"时间窗筛选共有 {num_time_filtered} 对被筛除，占 {num_time_filtered / count * 100:.2f}%")
-    print(f"总共被筛除 {total_filtered} 对，占 {total_filtered / count * 100:.2f}%")
-    print(f"耗时 {end - start:.2f}s, 平均 {(end - start) / count:.3f}s/次")
 
 def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
     '''
@@ -624,7 +774,8 @@ def single_satellite_safety(config: SafetyConfig | None = None) -> None:
         print("Error: 需要至少两个卫星的TLE数据。")
         return
     # 选择第一个卫星作为目标
-    tar = CSatellite(tles[0].line1, tles[0].line2, tles[0].line3)
+    tar_info = tles[0]
+    tar = CSatellite(tar_info.line1, tar_info.line2, tar_info.line3)
 
     geo1_filtered = 0
     geo2_filtered = 0
@@ -635,9 +786,9 @@ def single_satellite_safety(config: SafetyConfig | None = None) -> None:
     for tle in tles[1:]:
         pair_count += 1
         print(f"处理卫星: [{pair_count}] {tle.line1}")
-        con = CSatellite(tle.line1, tle.line2, tle.line3)
-        # evaluate_pair now returns (filtered_flag, geo1_filtered, geo2_filtered, time_filtered)
-        f, g1, g2, t = evaluate_pair(tar, con, config)
+        con_info = tle
+        con = CSatellite(con_info.line1, con_info.line2, con_info.line3)
+        f, g1, g2, t = evaluate_pair(tar, con, tar_info, con_info, config)
         total_filtered += f
         geo1_filtered += g1
         geo2_filtered += g2

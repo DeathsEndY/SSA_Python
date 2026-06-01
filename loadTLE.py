@@ -46,6 +46,8 @@ def fetch_all_tle_days(session, days):
 
     # Space-Track URL - 获取在days天内更新的最新在轨目标 TLE（3LE格式）
     URL_ALL_TLE = f"https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/epoch/>now-{days}/format/3le"
+    
+    # URL_ALL_TLE = "https://www.space-track.org/basicspacedata/query/class/gp/decay_date/null-val/epoch/<2026-05-30%2016:10:00/format/3le"
 
     print("Downloading all in-orbit TLE data (3LE format) …")
     resp = session.get(URL_ALL_TLE, stream=True)
@@ -125,7 +127,8 @@ def fetch_single_tle(norad_id):
     根据单个 NORAD 编号从 CelesTrak 获取最新 TLE
     """
     # 构造请求 URL，FORMAT=tle 表示返回标准两行元素格式
-    url = f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle"
+    # url = f"https://celestrak.org/NORAD/elements/gp.php?CATNR={norad_id}&FORMAT=tle"
+    url = f"https://www.space-track.org/basicspacedata/query/class/gp/NORAD_CAT_ID/{norad_id}/EPOCH/2026-04-20--2026-05-31/format/3le"
     
     try:
         response = requests.get(url, timeout=10)
