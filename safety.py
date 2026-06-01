@@ -7,19 +7,23 @@ safety.py
 
 0529 更新：增加了时间窗筛选的占位函数，调整了输出格式，并添加了tle处理的错误输出和跳过机制。
 0531 更新：原本处理卫星对部分数据冗余、序列化开销，现在精准传参，使用生成器和迭代器；增加概率计算和进度显示; 增加TCA附近最大概率寻优
+0601 更新：增加Top10风险事件表格输出（终端+图片）; 每次只保存Top10的数据，不保存所有风险事件
 """
 from __future__ import annotations
 
 import sys
 import time
 import datetime
+import numpy as np
+import os
+import matplotlib
+matplotlib.use('Agg')  # 防止在无 GUI 服务器上运行报错
+import matplotlib.pyplot as plt
 from dataclasses import dataclass
 from multiprocessing import Pool
 from pathlib import Path
 from typing import Callable, List, Optional, Union
 from scipy.optimize import minimize_scalar
-
-import numpy as np
 from astropy.time import Time, TimeDelta
 
 from closeApproach import ApproachInfo, CElement, find_arg_time, find_dec_time, GM_EARTH
@@ -31,13 +35,23 @@ HBR = 0.15
 RELTOL = 1e-10
 HBR_TYPE = "square"
 
+@dataclass
+class RiskEvent:
+    tar_name: str
+    con_name: str
+    tar_id: int
+    con_id: int
+    tca: datetime.datetime
+    rel_vel: float
+    min_dist: float
+    max_pc: float
 
 @dataclass(frozen=True)
 class SafetyConfig:
     threshold: float = 15.0
     day_window: float = 5.0
-    output_path: Path = Path("output/safety_output_paper1.txt")
-    tle_file: Path = Path("data/paper1.txt")
+    output_path: Path = Path("output/safety_output_part_tle0531_cal.txt")
+    tle_file: Path = Path("data/part_tle0531_cal.txt")
 
 
 @dataclass
@@ -256,74 +270,6 @@ def _nearest_crossing_window(
     return (center - TimeDelta(half_window, format="sec"), center + TimeDelta(half_window, format="sec"))
 
 
-# def _window_candidate_periods(
-#     tar_ele: CElement,
-#     con_ele: CElement,
-#     config: SafetyConfig,
-#     num_periods: int,
-# ) -> list[int]:
-#     """
-#     计算基于相位差的有效时间窗：
-#     返回目标卫星 (tar_sat) 可能发生危险交会的周期索引列表。
-#     """
-#     line_dir = _intersection_line_direction(tar_ele, con_ele)
-#     # 如果轨道近似平行或共面，保守起见返回所有周期
-#     if np.linalg.norm(line_dir) < 1e-8:
-#         return list(range(num_periods))
-
-#     line_dir_unit = line_dir / np.linalg.norm(line_dir)
-#     valid_indices = set()
-    
-#     T_tar = tar_ele.period
-#     T_con = con_ele.period
-
-#     # 必须检查交线的两个穿透点 (方向与反方向)
-#     for direction in [line_dir_unit, -line_dir_unit]:
-#         nu_tar = _true_anomaly_for_direction(tar_ele, direction)
-#         nu_con = _true_anomaly_for_direction(con_ele, direction)
-        
-#         t_tar_0 = _time_from_true_anomaly(tar_ele, nu_tar)
-#         t_con_0 = _time_from_true_anomaly(con_ele, nu_con)
-        
-#         # 将基准交点时间归一化到 epoch 附近
-#         t_tar_0 = _normalize_time_to_epoch(t_tar_0, tar_ele.epoch, T_tar)
-#         t_con_0 = _normalize_time_to_epoch(t_con_0, con_ele.epoch, T_con)
-        
-#         # Vis-viva 方程估算交点处的轨道速度
-#         r_tar = _radius_at_true_anomaly(tar_ele, nu_tar)
-#         r_con = _radius_at_true_anomaly(con_ele, nu_con)
-#         v_tar = np.sqrt(GM_EARTH * (2.0 / r_tar - 1.0 / tar_ele.semi_major_axis))
-#         v_con = np.sqrt(GM_EARTH * (2.0 / r_con - 1.0 / con_ele.semi_major_axis))
-        
-#         # 相对速度最大保守估计
-#         rel_v = float(v_tar + v_con)
-        
-#         # 计算安全时间窗
-#         safety_factor = 150
-#         half_window_sec = (config.threshold * safety_factor) / max(rel_v, 1e-6)
-        
-#         # 遍历目标星的每一圈 n
-#         for n in range(num_periods):
-#             # 目标卫星第 n 圈到达交点的时间
-#             t_tar_n = t_tar_0 + TimeDelta(n * T_tar, format="sec")
-            
-#             # 计算次星到达交点最接近 t_tar_n 的那一圈 (m)
-#             delta_t_sec = (t_tar_n - t_con_0).sec
-#             m = round(delta_t_sec / T_con)
-            
-#             # 为了防止浮点误差和边界情况，检查最接近的 3 圈 (m-1, m, m+1)
-#             for dm in [-1, 0, 1]:
-#                 closest_t_con = t_con_0 + TimeDelta((m + dm) * T_con, format="sec")
-#                 diff_sec = abs((t_tar_n - closest_t_con).sec)
-                
-#                 # 如果两星到达交点的时间差小于安全窗口，说明可能发生碰撞
-#                 if diff_sec <= half_window_sec:
-#                     valid_indices.add(n)
-#                     break  # 当前 n 圈已被标记为危险，跳出内部 dm 循环
-                    
-#     # 返回排序后的、可能发生交会的目标星圈数列表
-#     return sorted(list(valid_indices))
-
 def _window_candidate_periods(
     tar_ele: CElement,
     con_ele: CElement,
@@ -458,53 +404,6 @@ def _write_close_approach(
         )
     return 1
 
-
-# def _evaluate_approach_mode(
-#     tar_sat: CSatellite,
-#     con_sat: CSatellite,
-#     tar_info: TLEInfo,
-#     con_info: TLEInfo,
-#     period_indices: list[int],
-#     config: SafetyConfig,
-#     approach_fn: Callable[[CSatellite, CSatellite, int], 'ApproachInfo'],
-# ) -> int:
-    hits = 0
-    for i in period_indices:
-        approach_info = approach_fn(tar_sat, con_sat, i)
-        miss = find_miss_distance(tar_sat, con_sat, approach_info.time)
-        rel_vel = np.linalg.norm(
-            tar_sat.propagate(approach_info.time).vel - con_sat.propagate(approach_info.time).vel
-        )
-        if miss.min_distance < config.threshold:
-            # 组装 PcCalculate 所需的 TLE 字典格式
-            sat1_tle_dict = {"name": tar_info.line1, "tle1": tar_info.line2, "tle2": tar_info.line3}
-            sat2_tle_dict = {"name": con_info.line1, "tle1": con_info.line2, "tle2": con_info.line3}
-            
-            # 提取标准的 datetime 对象 (无时区信息)
-            t_datetime = miss.time.to_datetime().replace(tzinfo=None)
-
-            try:
-                pc = tle_to_pc_at_time(
-                    sat1_tle_dict, sat2_tle_dict, t_datetime,
-                    rtn_errors_km=EMPIRICAL_ERRORS,
-                    hbr=HBR,
-                    reltol=RELTOL,
-                    hbr_type=HBR_TYPE
-                )
-            except Exception as e:
-                # 若计算抛出异常（例如协方差不正定），静默处理为 0，防止打断主循环
-                pc = 0.0
-
-            hits += _write_close_approach(
-                tar_sat,
-                con_sat,
-                miss,
-                rel_vel,
-                pc,
-                config.output_path,
-            )
-    return hits
-
 def _evaluate_approach_mode(
     tar_sat: CSatellite,
     con_sat: CSatellite,
@@ -513,30 +412,23 @@ def _evaluate_approach_mode(
     period_indices: list[int],
     config: SafetyConfig,
     approach_fn: Callable[[CSatellite, CSatellite, int], 'ApproachInfo'],
-) -> int:
-    from scipy.optimize import minimize_scalar
-    import datetime
+) -> list[RiskEvent]:  # 修改返回值类型
 
-    hits = 0
+    events = []
     for i in period_indices:
         approach_info = approach_fn(tar_sat, con_sat, i)
         
-        # 这里的 miss.time 即为精确的几何交会时间 (TCA)
         miss = find_miss_distance(tar_sat, con_sat, approach_info.time)
         rel_vel = np.linalg.norm(
             tar_sat.propagate(miss.time).vel - con_sat.propagate(miss.time).vel
         )
         
         if miss.min_distance < config.threshold:
-            # 组装 PcCalculate 所需的 TLE 字典格式
             sat1_tle_dict = {"name": tar_info.line1, "tle1": tar_info.line2, "tle2": tar_info.line3}
             sat2_tle_dict = {"name": con_info.line1, "tle1": con_info.line2, "tle2": con_info.line3}
             
-            # 提取标准的 datetime 对象 (无时区信息) 作为基准 TCA
             tca_dt = miss.time.to_datetime().replace(tzinfo=None)
-
-            # === 核心修改：在 TCA 附近搜索最大碰撞概率 ===
-            pc_search_window_sec = 1.5  # 搜索窗口，TCA 前后 1.5 秒
+            pc_search_window_sec = 1.5  
             
             def negative_pc_at_offset(offset: float) -> float:
                 t_eval = tca_dt + datetime.timedelta(seconds=float(offset))
@@ -550,37 +442,37 @@ def _evaluate_approach_mode(
                     )
                     return -pc_val
                 except Exception:
-                    # 若积分失败或协方差截断异常，返回 0
                     return 0.0
 
             try:
-                # 使用 bounded 算法在 [-1.5s, 1.5s] 寻找使 Pc 最大的时间偏移
                 res_pc = minimize_scalar(
                     negative_pc_at_offset,
                     bounds=(-pc_search_window_sec, pc_search_window_sec),
                     method='bounded',
-                    options={'xatol': 1e-3}  # 精度控制到毫秒级即可
+                    options={'xatol': 1e-3}  
                 )
                 max_pc = -res_pc.fun
-                
-                # 如果你想在日志中记录最大概率发生的精确时间，可以计算：
-                # max_pc_time = tca_dt + datetime.timedelta(seconds=res_pc.x)
-                
             except Exception:
-                # 若优化器意外失败，平稳回退至直接计算 TCA 处的 Pc
                 max_pc = -negative_pc_at_offset(0.0)
-            # ===============================================
 
-            hits += _write_close_approach(
-                tar_sat,
-                con_sat,
-                miss,     # 保持传入 miss，这样日志里依然记录的是几何最近距离和 TCA
-                rel_vel,
-                max_pc,   # 传入优化后的最大碰撞概率
-                config.output_path,
+            # 写入日志
+            _write_close_approach(
+                tar_sat, con_sat, miss, rel_vel, max_pc, config.output_path
             )
             
-    return hits
+            # 将该事件记录到列表中
+            events.append(RiskEvent(
+                tar_name=tar_sat.name,
+                con_name=con_sat.name,
+                tar_id=tar_sat.sat_id,
+                con_id=con_sat.sat_id,
+                tca=tca_dt,
+                rel_vel=rel_vel,
+                min_dist=miss.min_distance,
+                max_pc=max_pc
+            ))
+            
+    return events
 
 def evaluate_pair(
         tar_sat: CSatellite, 
@@ -588,34 +480,36 @@ def evaluate_pair(
         tar_info: TLEInfo, 
         con_info: TLEInfo,
         config: SafetyConfig
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, list[RiskEvent]]:
     """
     多层筛选，若不通过返回 1，否则执行近点和远点计算。
+    0601：增加了返回值中的风险事件列表，供后续统计和表格输出使用。
     """
     # 几何筛选1
     if not geometrical_filter1(tar_sat, con_sat, config):
         # (filtered_flag, geo1_filtered, geo2_filtered, time_filtered)
-        return (1, 1, 0, 0)
+        return (1, 1, 0, 0, [])
 
     # 几何筛选2（基于轨道最近距离）
     if not geometrical_filter2(tar_sat, con_sat, config):
-        return (1, 0, 1, 0)
-
+        return (1, 0, 1, 0, [])
+    
     tar_ele = tar_sat.initial_element()
     con_ele = con_sat.initial_element()
     num_periods = max(1, int(config.day_window * 86400.0 / tar_ele.period))
 
     # 时间窗筛选
-    # valid_periods = _window_candidate_periods(tar_ele, con_ele, config, num_periods)
-    valid_periods = list(range(num_periods))
+    valid_periods = _window_candidate_periods(tar_ele, con_ele, config, num_periods)
+    # valid_periods = list(range(num_periods))   # 不进行时间窗筛选，验证算法时使用
     # print(f"valid_periods: {valid_periods}" )
     if len(valid_periods) == 0:
-        return (1, 0, 0, 1)
+        return (1, 0, 0, 1, [])
 
-    _evaluate_approach_mode(tar_sat, con_sat, tar_info, con_info, valid_periods, config, find_arg_time)
-    _evaluate_approach_mode(tar_sat, con_sat, tar_info, con_info, valid_periods, config, find_dec_time)
+    events = []
+    events.extend(_evaluate_approach_mode(tar_sat, con_sat, tar_info, con_info, valid_periods, config, find_arg_time))
+    events.extend(_evaluate_approach_mode(tar_sat, con_sat, tar_info, con_info, valid_periods, config, find_dec_time))
 
-    return (0, 0, 0, 0)
+    return (0, 0, 0, 0, events)
 
 
 def find_miss_distance(tar_sat: CSatellite, con_sat: CSatellite, time_point: Time) -> MissInfo:
@@ -671,6 +565,145 @@ def relative_rtn(tar_rv, con_rv):
     return np.dot(mat.T, tar_rv[:3] - con_rv[:3])
 
 
+# def _print_top10_tables(top_dist: list[RiskEvent], top_pc: list[RiskEvent]) -> None:
+#     if not top_dist and not top_pc:
+#         print("\n没有发现满足阈值的危险接近事件。")
+#         return
+        
+#     print("\n\n" + "="*105)
+#     print(" Top 10 危险事件 - 按【最近距离】排序 (距离从小到大)")
+#     print("="*105)
+#     print(f"{'主目标 (NORAD ID)':<22} | {'次目标 (NORAD ID)':<22} | {'TCA (UTC)':<20} | {'速度(km/s)':<10} | {'距离(km)':<10} | {'碰撞概率(Pc)':<12}")
+#     print("-" * 105)
+    
+#     # # 按照距离升序排序并取前 10
+#     # top_dist = sorted(events, key=lambda x: x.min_dist)[:10]
+#     for e in top_dist:
+#         tar_str = f"{e.tar_name[:13]} ({e.tar_id})"
+#         con_str = f"{e.con_name[:13]} ({e.con_id})"
+#         print(f"{tar_str:<22} | {con_str:<22} | {e.tca.strftime('%Y-%m-%d %H:%M:%S'):<20} | {e.rel_vel:<10.3f} | {e.min_dist:<10.3f} | {e.max_pc:<12.4e}")
+              
+#     print("\n" + "="*105)
+#     print(" Top 10 危险事件 - 按【碰撞概率】排序 (概率从大到小)")
+#     print("="*105)
+#     print(f"{'主目标 (NORAD ID)':<22} | {'次目标 (NORAD ID)':<22} | {'TCA (UTC)':<20} | {'速度(km/s)':<10} | {'距离(km)':<10} | {'碰撞概率(Pc)':<12}")
+#     print("-" * 105)
+    
+#     # # 按照碰撞概率降序排序并取前 10
+#     # top_pc = sorted(events, key=lambda x: x.max_pc, reverse=True)[:10]
+#     for e in top_pc:
+#         tar_str = f"{e.tar_name[:13]} ({e.tar_id})"
+#         con_str = f"{e.con_name[:13]} ({e.con_id})"
+#         print(f"{tar_str:<22} | {con_str:<22} | {e.tca.strftime('%Y-%m-%d %H:%M:%S'):<20} | {e.rel_vel:<10.3f} | {e.min_dist:<10.3f} | {e.max_pc:<12.4e}")
+
+def _print_top10_tables(top_dist: list[RiskEvent], top_pc: list[RiskEvent], output_dir: str = "output/gragh") -> None:
+    
+    # === 1. 终端文本输出 ===
+    if not top_dist and not top_pc:
+        print("\n没有发现满足阈值的危险接近事件。")
+        return
+        
+    print("\n\n" + "="*105)
+    print(" Top 10 危险事件 - 按【最近距离】排序 (距离从小到大)")
+    print("="*105)
+    print(f"{'主目标 (NORAD ID)':<22} | {'次目标 (NORAD ID)':<22} | {'TCA (UTC)':<20} | {'速度(km/s)':<10} | {'距离(km)':<10} | {'碰撞概率(Pc)':<12}")
+    print("-" * 105)
+    
+    for e in top_dist:
+        tar_str = f"{e.tar_name[:13]} ({e.tar_id})"
+        con_str = f"{e.con_name[:13]} ({e.con_id})"
+        print(f"{tar_str:<22} | {con_str:<22} | {e.tca.strftime('%Y-%m-%d %H:%M:%S'):<20} | {e.rel_vel:<10.3f} | {e.min_dist:<10.3f} | {e.max_pc:<12.4e}")
+              
+    print("\n" + "="*105)
+    print(" Top 10 危险事件 - 按【碰撞概率】排序 (概率从大到小)")
+    print("="*105)
+    print(f"{'主目标 (NORAD ID)':<22} | {'次目标 (NORAD ID)':<22} | {'TCA (UTC)':<20} | {'速度(km/s)':<10} | {'距离(km)':<10} | {'碰撞概率(Pc)':<12}")
+    print("-" * 105)
+    
+    for e in top_pc:
+        tar_str = f"{e.tar_name[:13]} ({e.tar_id})"
+        con_str = f"{e.con_name[:13]} ({e.con_id})"
+        print(f"{tar_str:<22} | {con_str:<22} | {e.tca.strftime('%Y-%m-%d %H:%M:%S'):<20} | {e.rel_vel:<10.3f} | {e.min_dist:<10.3f} | {e.max_pc:<12.4e}")
+
+    # === 2. 导出图片输出 ===
+    os.makedirs(output_dir, exist_ok=True)
+    
+    def save_table_img(data_list, title, filename, is_pc_sort=False):
+        if not data_list:
+            return
+            
+        headers = [
+            "Primary Satellite\n(NORAD ID)", 
+            "Secondary Satellite\n(NORAD ID)", 
+            "TCA (UTC)", 
+            "Rel Vel\n(km/s)", 
+            "Min Dist\n(km)", 
+            "Prob of Collision\n(Pc)"
+        ]
+        
+        cell_text = []
+        for e in data_list:
+            cell_text.append([
+                f"{e.tar_name}\n({e.tar_id})",
+                f"{e.con_name}\n({e.con_id})",
+                e.tca.strftime("%Y-%m-%d\n%H:%M:%S"),
+                f"{e.rel_vel:.3f}",
+                f"{e.min_dist:.4f}",
+                f"{e.max_pc:.4e}"
+            ])
+            
+        fig, ax = plt.subplots(figsize=(12, 6), dpi=200)
+        ax.axis('off')
+        ax.axis('tight')
+        
+        table = ax.table(
+            cellText=cell_text, 
+            colLabels=headers, 
+            cellLoc='center', 
+            loc='center'
+        )
+        
+        table.auto_set_font_size(False)
+        table.set_fontsize(10)
+        table.scale(1.0, 2.2) # 略微拉高行距，显得不拥挤
+        
+        # 样式颜色
+        header_bg = '#1F4E79'
+        header_fg = '#FFFFFF'
+        row_bg_even = '#F2F4F7'
+        row_bg_odd = '#FFFFFF'
+        # 第一排危险事件的高亮：距离表用警告色(浅橙)，概率表用警惕色(浅绿)
+        highlight_bg = '#FCE4D6' if not is_pc_sort else '#E2EFDA' 
+        
+        for (row, col), cell in table.get_celld().items():
+            if row == 0:
+                cell.set_text_props(weight='bold', color=header_fg)
+                cell.set_facecolor(header_bg)
+            else:
+                if row % 2 == 0:
+                    cell.set_facecolor(row_bg_even)
+                else:
+                    cell.set_facecolor(row_bg_odd)
+                
+                # Top 1 极度高亮
+                if row == 1:
+                    cell.set_facecolor(highlight_bg)
+                    cell.set_text_props(weight='bold')
+                    
+            cell.set_edgecolor('#D9D9D9')
+            cell.set_linewidth(0.8)
+            
+        plt.title(title, fontsize=14, weight='bold', pad=20, color='#333333')
+        
+        filepath = os.path.join(output_dir, filename)
+        plt.savefig(filepath, bbox_inches='tight', pad_inches=0.3)
+        plt.close()
+        print(f"成功保存报告图片到: {filepath}")
+
+    # 调用绘图子函数
+    save_table_img(top_dist, "Top 10 Conjunction Events - Sorted by Minimum Distance", "top10_min_dist.png", is_pc_sort=False)
+    save_table_img(top_pc, "Top 10 Conjunction Events - Sorted by Collision Probability (Pc)", "top10_max_pc.png", is_pc_sort=True)
+
 def process_satellite_pair(args):
     '''
     处理单个卫星对的入口函数：从TLE信息创建卫星对象，执行评估，并处理可能的异常。
@@ -695,7 +728,7 @@ def process_satellite_pair(args):
         except Exception:
             # 若写文件也失败，则静默忽略以避免二次异常
             pass
-        return (1, 0, 0, 0)
+        return (1, 0, 0, 0, [])
 
 
 def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
@@ -718,6 +751,10 @@ def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
                 yield (i, tles[i], j, tles[j], config)
 
     results = []
+    # 两个独立列表维护 Top 10事件
+    top10_min_dist: list[RiskEvent] = []
+    top10_max_pc: list[RiskEvent] = []
+    
     last_logged_milestone = -1  # 记录上一次写入文件的进度里程碑
 
     print("开始处理卫星对，进度如下：")
@@ -725,7 +762,20 @@ def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
         iterator = pool.imap_unordered(process_satellite_pair, generate_tasks(), chunksize=1000)
         
         for idx, result in enumerate(iterator, start=1):
-            results.append(result)
+            results.append(result[:4])
+            events = result[4]
+            
+            # 只维护 Top 10 变量，防内存溢出
+            if events:
+                # 维护最小距离 Top 10
+                top10_min_dist.extend(events)
+                top10_min_dist.sort(key=lambda x: x.min_dist)
+                top10_min_dist = top10_min_dist[:10]
+                
+                # 维护最大概率 Top 10
+                top10_max_pc.extend(events)
+                top10_max_pc.sort(key=lambda x: x.max_pc, reverse=True)
+                top10_max_pc = top10_max_pc[:10]
             
             # 1. 计算当前的精确百分比
             percent = (idx / total_pairs) * 100
@@ -745,8 +795,8 @@ def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
                     with config.output_path.open("a", encoding="utf-8") as f:
                         f.write(progress_msg)
                 except Exception:
-                    pass # 若写入失败静默处理，避免中断主计算流程
-                    
+                    pass # 若写入失败静默处理，避免中断主计算流程 
+
     print() # 进度条结束后输出一个换行符，防止后续统计数据粘在同一行
 
     # --- 后续的统计和打印代码保持不变 ---
@@ -756,6 +806,7 @@ def process_all_satellite_pairs(config: SafetyConfig | None = None) -> None:
     num_time_filtered = sum(r[3] for r in results)
     end = time.time()
     
+    _print_top10_tables(top10_min_dist, top10_max_pc)
     print(f"共处理 {n} 个目标，共处理 {total_pairs} 对")
     print(f"几何筛选1共有 {num_geo1_filtered} 对被筛除，占 {num_geo1_filtered / total_pairs * 100:.2f}%")
     print(f"几何筛选2共有 {num_geo2_filtered} 对被筛除，占 {num_geo2_filtered / total_pairs * 100:.2f}%")
@@ -782,19 +833,33 @@ def single_satellite_safety(config: SafetyConfig | None = None) -> None:
     time_filtered = 0
     total_filtered = 0
     pair_count = 0
+    
+    top10_min_dist: list[RiskEvent] = []
+    top10_max_pc: list[RiskEvent] = []
 
     for tle in tles[1:]:
         pair_count += 1
         print(f"处理卫星: [{pair_count}] {tle.line1}")
         con_info = tle
         con = CSatellite(con_info.line1, con_info.line2, con_info.line3)
-        f, g1, g2, t = evaluate_pair(tar, con, tar_info, con_info, config)
+        
+        f, g1, g2, t, events = evaluate_pair(tar, con, tar_info, con_info, config)
         total_filtered += f
         geo1_filtered += g1
         geo2_filtered += g2
         time_filtered += t
+        
+        if events:
+            top10_min_dist.extend(events)
+            top10_min_dist.sort(key=lambda x: x.min_dist)
+            top10_min_dist = top10_min_dist[:10]
+            
+            top10_max_pc.extend(events)
+            top10_max_pc.sort(key=lambda x: x.max_pc, reverse=True)
+            top10_max_pc = top10_max_pc[:10]
 
     end = time.time()
+    _print_top10_tables(top10_min_dist, top10_max_pc)
     print(f"共处理 {len(tles)} 个目标，共处理 {pair_count} 对")
     print(f"几何筛选1共有 {geo1_filtered} 对被筛除，占 {geo1_filtered / pair_count * 100:.2f}%")
     print(f"几何筛选2共有 {geo2_filtered} 对被筛除，占 {geo2_filtered / pair_count * 100:.2f}%")
